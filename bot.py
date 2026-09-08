@@ -104,6 +104,25 @@ body: основной авторский текст максимально бл
 Кодовые слова для записи, реальные бренды и аббревиатуры не искажай.
 Списки услуг/условий/требований делай через «–» (пункты одного списка внутри одного
 элемента body, разделённые переносами строк). Сам НЕ ДОБАВЛЯЙ списков требований.
+ПРАЙСЫ И РАЗДЕЛЫ УСЛУГ — исключение из правила объединения связанных фраз.
+Для ЛЮБОЙ услуги оформляй раздел отдельным элементом body: короткое название
+с двоеточием на отдельной строке, затем каждая позиция с ценой на новой строке.
+В JSON используй переносы строк внутри строки. Между разделами один пустой абзац,
+между позициями внутри раздела пустых строк нет. Не склеивай позиции через точку
+с запятой или в сплошной абзац. В прайсе не нужен маркер перед названием позиции:
+«Название — цена вместо прежней цены». Сохраняй уточнения в скобках.
+Пример структуры (применяется ко всем услугам, не только этим):
+Губы:
+Revolax — 6000 вместо 13 000
+Stylage M — 9900 вместо 17 000
+
+Ботокс:
+Верхняя треть полностью — 6000 вместо 15 000
+Нижняя треть (убираем брыли) — 6000 вместо 15 000
+Условия, инструкции и требования рядом с прайсом сохраняй отдельным следующим
+абзацем, не приписывай их к строке цены. Цифры не меняй и не дополняй нулями
+по догадке; допустимы только пробелы между разрядами. Не переноси примерные
+услуги, препараты и цены из этой инструкции в объявление.
 Удали ВСЕ эмодзи из body; значки для служебных полей добавляет программа.
 Сохрани цитаты: каждый переданный ключ [[QUOTE_...]] вставь в body отдельной строкой
 в исходном месте ровно один раз. Их содержимое не дублируй: программа восстановит цитаты.
@@ -303,7 +322,23 @@ def without_contact_duplicates(text, contacts):
     return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
+def format_price_block(text):
+    # Repair collapsed price lists without guessing service names or amounts.
+    price = r"[—–-]\s*\d"
+    if not re.search(price, text):
+        return text
+    text = re.sub(r";[ \t]*(?=[^;\n]+[—–-]\s*\d)", "\n", text)
+    text = re.sub(r"^([^:\n]{1,70}:)[ \t]+(?=[^\n]+[—–-]\s*\d)", r"\1\n", text)
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(price, line):
+            lines[i] = re.sub(r"^[–—-]\s+", "", line)
+    return "\n".join(lines)
+
+
 def same_source_paragraph(left, right, source):
+    if "\n" in left or "\n" in right or left.endswith(":") or re.search(r"[—–-]\s*\d", left+right):
+        return False
     def norm(t):
         return " ".join(re.findall(r"[а-яёa-z0-9]+", t.lower()))
     pair = norm(left)+" "+norm(right)
@@ -406,7 +441,7 @@ def render_post(data, quotes=None, source=""):
                         plain(part)
                         previous_body = part
                     elif part.strip():
-                        cleaned = without_contact_duplicates(clean_text(part), data["contacts"])
+                        cleaned = format_price_block(without_contact_duplicates(clean_text(part), data["contacts"]))
                         if cleaned:
                             if previous_body and same_source_paragraph(previous_body, cleaned, source) and rows[-1][0] == "":
                                 rows.pop()
@@ -773,7 +808,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 5.3.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 5.4.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -884,7 +919,7 @@ def webhook_handler(app):
 
         def do_GET(self):
             if self.path in ("/", "/health"):
-                self.reply(200 if app.accepting else 503, "Post editor 5.3: " + app.registration_status)
+                self.reply(200 if app.accepting else 503, "Post editor 5.4: " + app.registration_status)
             else:
                 self.reply(404, "Not found")
 
@@ -944,7 +979,7 @@ class WebhookApp:
                     allowed_updates=["message", "callback_query"], max_connections=1,
                     drop_pending_updates=False)
         self.registration_status = "webhook connected"
-        print("Editor 5.3: webhook connected; no background Telegram polling.", flush=True)
+        print("Editor 5.4: webhook connected; no background Telegram polling.", flush=True)
         return True
 
     def register_startup(self):
