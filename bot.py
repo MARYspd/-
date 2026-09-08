@@ -82,7 +82,14 @@ cost: самая низкая цена ПОЛНОЦЕННОЙ указанной
 
 body: основной авторский текст максимально близко к оригиналу, кроме перенесенных в поля
 даты, общей стоимости, контактов, локации и подписи. Не убирай факты ради краткости.
-Не дроби каждое предложение на абзац. Связанные фразы объединяй естественно.
+Не дроби каждое предложение на абзац. Сохраняй группировку исходных абзацев:
+соседние связанные фразы одного исходного абзаца должны быть одним элементом body.
+«Инъекции — это вчера! Есть метод волшебнее.» — один абзац.
+Заголовок списка с двоеточием располагается непосредственно перед списком/цитатой.
+Не повторяй в body номера, ссылки и @username из contacts: они выводятся только
+в полях контактов. Сохрани полезную инструкцию записи и кодовое слово без контакта.
+Капслок убирай также ВНУТРИ предложения: «на БЕСПЛАТНЫЙ СЕАНС» → «на бесплатный сеанс».
+Кодовые слова для записи, реальные бренды и аббревиатуры не искажай.
 Списки услуг/условий/требований делай через «–» (пункты одного списка внутри одного
 элемента body, разделённые переносами строк). Сам НЕ ДОБАВЛЯЙ списков требований.
 Удали ВСЕ эмодзи из body; значки для служебных полей добавляет программа.
@@ -121,22 +128,20 @@ POST_SCHEMA = {
 
 
 def normalize_caps(text):
-    # Normalize full shouted Russian sentences; leave brands and abbreviations alone.
-    chunks = re.split(r"(?<=[.!?])(?=\s)|\n", text)
-    result = []
-    for chunk in chunks:
-        letters = re.findall(r"[А-Яа-яЁё]", chunk)
-        if len(letters) >= 10 and all(c.isupper() for c in letters) and not re.search(r"[A-Za-z@/]", chunk):
-            chunk = chunk.lower()
-            chunk = re.sub(r"[а-яё]", lambda m: m[0].upper(), chunk, count=1)
-        result.append(chunk)
-    # Preserve original delimiters (including newlines) instead of reflowing prose.
-    parts = re.split(r"((?<=[.!?])(?=\s)|\n)", text)
-    i = 0
-    for index in range(0, len(parts), 2):
-        parts[index] = result[i]
-        i += 1
-    return "".join(parts)
+    # Lowercase shouted words even inside mixed-case prose. Preserve links,
+    # short abbreviations and quoted booking passwords/brand names.
+    protected = re.compile(r'https?://[^\s]+|@[A-Za-z0-9_]+|«[^»]*»|"[^"\n]*"')
+    def fix(segment):
+        return re.sub(r"(?<![\w])(?:[А-ЯЁ]{4,}|НА|ДЛЯ|И|В|ПО|ЗА|ОТ|ДО|НЕ|С|К)(?![\w])", lambda m: m[0].lower(), segment)
+    parts = []; end = 0
+    for match in protected.finditer(text):
+        parts.extend([fix(text[end:match.start()]), match[0]]);end=match.end()
+    parts.append(fix(text[end:]));result="".join(parts)
+    for match in reversed(list(re.finditer(r"(^|[.!?]\s+|\n[– ]*)([а-яё])", result))):
+        index = match.start(2)
+        if index < len(text) and text[index].isupper():
+            result = result[:index] + result[index].upper() + result[index+1:]
+    return result
 
 
 def units(text):
@@ -187,7 +192,30 @@ def source_with_quotes(message, quotes):
     return result.strip()
 
 
-def render_post(data, quotes=None):
+def without_contact_duplicates(text, contacts):
+    for c in contacts:
+        value = c.get("value", "") if isinstance(c, dict) else ""
+        if not isinstance(value, str):
+            continue
+        for token in re.findall(r"@[A-Za-z0-9_]+|https?://[^\s]+", value):
+            text = re.sub(re.escape(token.rstrip('.,)')) + r"(?![\w])", "", text, flags=re.I)
+        if c.get("type") in ("Телефон", "WhatsApp"):
+            for phone in re.findall(r"\+?\d[\d ()-]{8,}\d", value):
+                digits = re.sub(r"\D", "", phone)
+                pattern = r"(?<!\d)\+?" + r"[ ()-]*".join(digits) + r"(?!\d)"
+                text = re.sub(pattern, "", text)
+    text = re.sub(r"[ \t]+([,.;!?])", r"\1", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+
+def same_source_paragraph(left, right, source):
+    def norm(t):
+        return " ".join(re.findall(r"[а-яёa-z0-9]+", t.lower()))
+    pair = norm(left)+" "+norm(right)
+    return any(pair in norm(p) for p in re.split(r"\n\s*\n", source))
+
+
+def render_post(data, quotes=None, source=""):
     quotes = quotes or {}
     if not isinstance(data, dict):
         raise ApiError("Groq", "invalid_format")
@@ -212,6 +240,7 @@ def render_post(data, quotes=None):
     field("📆", "Когда:", data["when"].strip() or "по записи")
     field("💰", "Стоимость:", data["cost"].strip() or "уточнять в личных сообщениях")
     used_quotes = []
+    previous_body = ""
     if any(p.strip() for p in data["body"]):
         plain("")
         for paragraph in data["body"]:
@@ -220,12 +249,21 @@ def render_post(data, quotes=None):
                 for part in re.split(r"(\[\[QUOTE_[a-f0-9]+\]\])", paragraph):
                     if part in quotes:
                         used_quotes.append(part)
+                        if previous_body.endswith(":") and rows[-1][0] == "":
+                            rows.pop()
                         plain(part)
+                        previous_body = part
                     elif part.strip():
-                        cleaned = clean_text(part)
+                        cleaned = without_contact_duplicates(clean_text(part), data["contacts"])
                         if cleaned:
+                            if previous_body and same_source_paragraph(previous_body, cleaned, source) and rows[-1][0] == "":
+                                rows.pop()
+                                prior = rows.pop()[0]
+                                cleaned = prior + " " + cleaned
                             plain(cleaned)
-                plain("")
+                            previous_body = cleaned
+                if rows[-1][0]:
+                    plain("")
     if data["metro"].strip() or data["address"].strip():
         if rows[-1][0]:
             plain("")
@@ -260,7 +298,7 @@ def render_post(data, quotes=None):
         start = units(text)
         if line in quotes:
             quote_text, quote_type = quotes[line]
-            line = quote_text
+            line = without_contact_duplicates(quote_text, data["contacts"])
             if line:
                 entities.append({"type": quote_type, "offset": start, "length": units(line)})
         text += line
@@ -471,7 +509,7 @@ class Bot:
         context = text
         if quotes:
             context += "\n\nЦитаты: вставь каждый ключ отдельным элементом body ровно один раз на исходном месте. Не переписывай содержимое цитат в body:\n" + json.dumps({k:v[0] for k,v in quotes.items()}, ensure_ascii=False)
-        result, entities = render_post(self.ai(context), quotes)
+        result, entities = render_post(self.ai(context), quotes, text)
         entities = custom_entities(result, entities, self.emoji_store.values)
         # Flag possible omission of literal contacts; never silently claim full verification.
         contacts = re.findall(r"@[A-Za-z0-9_]+|https?://[^\s<>]+", text)
@@ -576,7 +614,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 4.3.\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 4.4.\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -621,7 +659,7 @@ class Bot:
         webhook = self.tg("getWebhookInfo")
         if webhook.get("url"):
             raise ConfigError("WEBHOOK_ACTIVE: сначала отключи прежнее подключение бота. Автоматически ничего не удалено.")
-        print("Editor 4.3 started", flush=True)
+        print("Editor 4.4 started", flush=True)
         offset = 0
         while True:
             try:
