@@ -1,5 +1,6 @@
 """Private photo-and-text post editor. Python standard library only."""
-import html
+from pathlib import Path
+import tempfile
 import json
 import os
 import re
@@ -7,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 
-KEYBOARD = {"remove_keyboard": True}
+KEYBOARD = {"keyboard": [["Оформить пост", "Настроить эмодзи"]], "resize_keyboard": True}
 
 
 class ConfigError(Exception):
@@ -58,7 +59,7 @@ EDITOR_RULES = """Редактируй объявления аккуратно �
 Не превращай авторский текст в рекламный пересказ. Сохрани обращения и первое лицо автора.
 
 Верни JSON со строками title, when, cost, metro, address; массивами строк body и hashtags;
-массивом contacts из объектов {"type":"Telegram|Телефон|WhatsApp|Instagram / Direct|Контакт", "value":"..."}.
+массивом contacts из объектов {"type":"Telegram|Телефон|WhatsApp|Instagram / Direct|Канал|Контакт", "value":"..."}.
 Никакого HTML/Markdown. Оформление добавляет программа.
 
 title: если процедура одна — точное название. Если несколько — короткое понятное общее
@@ -85,6 +86,7 @@ body: основной авторский текст максимально бл
 contacts: только фактически указанные контакты. «Тг», «телега», t.me — Telegram;
 Instagram/инста/Direct — Instagram / Direct; WhatsApp — WhatsApp; обычный номер — Телефон.
 Сохрани точные @username, телефоны и ссылки. Не заменяй имя Instagram на Telegram.
+Если ссылка обозначена автором как канал, используй тип Канал, сохрани ссылку.
 Если тип контакта определить нельзя, используй Контакт, не угадывай платформу.
 Телефон можно аккуратно разбить пробелами, нельзя менять цифры.
 metro: название метро, только если указано. address: адрес и студия из исходника.
@@ -104,7 +106,7 @@ POST_SCHEMA = {
         **{k: {"type": "array", "items": {"type": "string"}} for k in ("body", "hashtags")},
         "contacts": {"type": "array", "items": {
             "type": "object", "additionalProperties": False, "required": ["type", "value"],
-            "properties": {"type": {"type": "string", "enum": ["Telegram", "Телефон", "WhatsApp", "Instagram / Direct", "Контакт"]}, "value": {"type": "string"}}
+            "properties": {"type": {"type": "string", "enum": ["Telegram", "Телефон", "WhatsApp", "Instagram / Direct", "Канал", "Контакт"]}, "value": {"type": "string"}}
         }}
     }
 }
@@ -172,7 +174,7 @@ def render_post(data):
         if data["address"].strip():
             plain(data["address"].strip())
         plain("")
-    icons = {"Telegram": "🤩", "Телефон": "📞", "WhatsApp": "📞", "Instagram / Direct": "🤩", "Контакт": "🤩"}
+    icons = {"Telegram": "🤩", "Телефон": "📞", "WhatsApp": "📞", "Instagram / Direct": "🤩", "Канал": "🤩", "Контакт": "🤩"}
     if data["contacts"] and rows[-1][0]:
         plain("")
     for contact in data["contacts"]:
@@ -235,6 +237,69 @@ def error_message(exc):
     return "Ошибка программы: " + type(exc).__name__ + ". Пришли этот ответ разработчику."
 
 
+EMOJI_SLOTS = {
+    "title": ("Заголовок", "📌"), "when": ("Когда", "📆"),
+    "cost": ("Стоимость", "💰"), "telegram": ("Telegram", "🤩"),
+    "whatsapp": ("WhatsApp", "📞"), "phone": ("Телефон", "📞"),
+    "instagram": ("Instagram / Direct", "🤩"), "channel": ("Канал", "🤩"),
+    "contact": ("Другие контакты", "🤩"), "location": ("Локация", "📍"),
+    "metro": ("Метро", "Ⓜ️"), "footer": ("Ищу модель Москва", "🤍")
+}
+
+
+def custom_entities(text, entities, settings):
+    result = list(entities)
+    prefixes = {"📌 ": "title", "📆 Когда:": "when", "💰 Стоимость:": "cost",
+                "🤩 Telegram:": "telegram", "📞 WhatsApp:": "whatsapp", "📞 Телефон:": "phone",
+                "🤩 Instagram / Direct:": "instagram", "🤩 Канал:": "channel", "🤩 Контакт:": "contact",
+                "📍 Локация:": "location", "Ⓜ️ ": "metro", "🤍 Ищу модель Москва": "footer"}
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        for prefix, slot in prefixes.items():
+            if line.startswith(prefix):
+                emoji_id = settings.get(slot)
+                if emoji_id:
+                    result.append({"type": "custom_emoji", "offset": offset,
+                                   "length": units(EMOJI_SLOTS[slot][1]), "custom_emoji_id": emoji_id})
+                break
+        offset += units(line)
+    return sorted(result, key=lambda e: (e["offset"], -e["length"]))
+
+
+class EmojiStore:
+    def __init__(self, owner):
+        self.directory = Path(os.environ.get("STATE_DIR", "/data"))
+        self.path = self.directory / ("emoji-" + str(owner) + ".json")
+        self.persistent = (os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") == str(self.directory)
+                           or os.path.ismount(self.directory))
+        self.values = {}
+        if self.path.exists():
+            try:
+                value = json.loads(self.path.read_text())
+                if not isinstance(value, dict) or any(k not in EMOJI_SLOTS or not isinstance(v, str) or not re.fullmatch(r"[0-9]{1,30}", v) for k, v in value.items()):
+                    raise ValueError()
+                self.values = value
+            except (ValueError, OSError):
+                raise ConfigError("EMOJI_SETTINGS_INVALID: файл настроек эмодзи повреждён или недоступен; исходный файл не изменён.") from None
+
+    def save(self, values):
+        temp_path = None
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.directory, prefix="emoji-", suffix=".tmp", delete=False) as f:
+                temp_path = f.name
+                json.dump(values, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.path)
+            self.values = dict(values)
+        except OSError:
+            raise ConfigError("Не удалось сохранить эмодзи. Подключи Volume с путём /data и обновлённый Dockerfile. Прежние настройки сохранены.") from None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
 class Bot:
     def __init__(self):
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -251,6 +316,9 @@ class Bot:
         self.pending_photos = []
         self.pending_at = 0
         self.groups = {}
+        self.emoji_store = EmojiStore(self.owner)
+        self.awaiting_emoji = None
+        self.awaiting_emoji_at = 0
 
     def tg(self, method, **payload):
         data = request_json("https://api.telegram.org/bot" + self.token + "/" + method, payload, "Telegram")
@@ -333,6 +401,7 @@ class Bot:
         except ApiError:
             pass
         result, entities = render_post(self.ai(text))
+        entities = custom_entities(result, entities, self.emoji_store.values)
         # Flag possible omission of literal contacts; never silently claim full verification.
         contacts = re.findall(r"@[A-Za-z0-9_]+|https?://[^\s<>]+", text)
         missing = [x for x in contacts if x.rstrip('.,)') not in result]
@@ -342,7 +411,77 @@ class Bot:
         self.deliver(result, entities, photos)
         self.pending_photos = []
 
+    def emoji_menu(self):
+        self.awaiting_emoji = None
+        buttons = [{"text": ("✓ " if slot in self.emoji_store.values else "") + label, "callback_data": "emoji:" + slot}
+                   for slot, (label, _) in EMOJI_SLOTS.items()]
+        keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        storage = "Настройки сохраняются в постоянном хранилище." if self.emoji_store.persistent else "Сначала подключи в Railway Volume с путём /data: без него настройки могут исчезнуть при обновлении сервера."
+        self.tg("sendMessage", chat_id=self.owner, text="Выбери поле, затем отправь ОДИН кастомный эмодзи отдельным сообщением.\n«Стандартный» вернёт обычный значок для выбранного поля.\n/cancel — выйти.\n\n" + storage,
+                reply_markup={"inline_keyboard": keyboard})
+
+    def emoji_callback(self, callback):
+        msg = callback.get("message", {})
+        if not self.owner or callback.get("from", {}).get("id") != self.owner or msg.get("chat", {}).get("id") != self.owner:
+            return
+        data = callback.get("data", "")
+        try:
+            self.tg("answerCallbackQuery", callback_query_id=callback["id"])
+        except ApiError:
+            pass
+        slot = data.removeprefix("emoji:")
+        if not data.startswith("emoji:") or slot not in EMOJI_SLOTS:
+            return
+        self.awaiting_emoji = slot
+        self.awaiting_emoji_at = time.time()
+        self.pending_photos = []
+        self.tg("sendMessage", chat_id=self.owner,
+                text="Отправь один кастомный эмодзи для поля «" + EMOJI_SLOTS[slot][0] + "». Это должен быть эмодзи в сообщении, не стикер и не скриншот.",
+                reply_markup={"keyboard": [["Стандартный", "Отмена"]], "resize_keyboard": True})
+
+    def accept_emoji(self, message):
+        slot = self.awaiting_emoji
+        if not slot:
+            return
+        if time.time() - self.awaiting_emoji_at > 600:
+            self.awaiting_emoji = None
+            self.send("Время выбора истекло. Нажми «Настроить эмодзи» ещё раз.")
+            return
+        text = message.get("text", "")
+        new_values = dict(self.emoji_store.values)
+        if text.strip() == "Стандартный":
+            new_values.pop(slot, None)
+        else:
+            custom = [e for e in message.get("entities", []) if e.get("type") == "custom_emoji"]
+            if len(custom) != 1:
+                self.send("Отправь ровно один кастомный эмодзи без подписи. Или /cancel для выхода.")
+                return
+            entity = custom[0]
+            emoji_id = entity.get("custom_emoji_id", "")
+            if not isinstance(emoji_id, str) or not re.fullmatch(r"[0-9]{1,30}", emoji_id):
+                self.send("Не удалось распознать идентификатор эмодзи. Попробуй отправить его заново.")
+                return
+            raw = text.encode("utf-16-le")
+            start = entity.get("offset", 0) * 2
+            end = start + entity.get("length", 0) * 2
+            if raw[:start].decode("utf-16-le").strip() or raw[end:].decode("utf-16-le").strip():
+                self.send("Нужен только один эмодзи, без другого текста.")
+                return
+            alt = EMOJI_SLOTS[slot][1]
+            preview = self.tg("sendMessage", chat_id=self.owner, text=alt + " — проверка эмодзи",
+                              entities=[{"type": "custom_emoji", "offset": 0, "length": units(alt), "custom_emoji_id": emoji_id}])
+            if not any(e.get("type") == "custom_emoji" and e.get("custom_emoji_id") == emoji_id for e in preview.get("entities", [])):
+                self.send("Telegram не подтвердил кастомный эмодзи. Проверь Premium на аккаунте владельца бота. Настройку пока не сохранила.")
+                return
+            new_values[slot] = emoji_id
+        self.emoji_store.save(new_values)
+        self.awaiting_emoji = None
+        self.send("Сохранено для поля «" + EMOJI_SLOTS[slot][0] + "». Можно выбрать следующий значок через «Настроить эмодзи».")
+
     def handle(self, update):
+        if "callback_query" in update:
+            self.emoji_callback(update["callback_query"])
+            return
         message = update.get("message")
         if not message or message.get("chat", {}).get("type") != "private" or message.get("from", {}).get("is_bot"):
             return
@@ -354,21 +493,29 @@ class Bot:
             return
         if uid != self.owner or message["chat"]["id"] != self.owner:
             return
+        if text in ("/emoji", "Настроить эмодзи"):
+            self.emoji_menu()
+            return
+        if self.awaiting_emoji and text not in ("/cancel", "Отмена", "/start", "/help", "/status", "/test", "/id", "Оформить пост"):
+            self.accept_emoji(message)
+            return
         if text in ("/start", "/help", "Оформить пост"):
+            self.awaiting_emoji = None
             self.send("Пришли пост: фото с подписью, альбом с подписью или просто текст. Верну твои фото и оформленный текст. Можно сначала фото, затем текст в течение 10 минут.\n/status — версия; /test — связь с Groq; /cancel — отменить ожидающее фото.\nПроверь цену, дату и контакты перед публикацией.")
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 4.1.\nМодель: {self.model}.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 4.2.\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
-        elif text == "/cancel":
+        elif text in ("/cancel", "Отмена"):
+            self.awaiting_emoji = None
             self.pending_photos = []
             self.groups.clear()
-            self.send("Ожидающие фото отменены. Пришли новый пост.")
+            self.send("Выбор эмодзи и ожидающие фото отменены. Пришли новый пост.")
         elif text.startswith("/"):
-            self.send("Доступны /start, /status, /test, /id и /cancel. Или просто перешли пост.")
+            self.send("Доступны /start, /status, /test, /id, /emoji и /cancel. Или просто перешли пост.")
         elif message.get("media_group_id"):
             group = self.groups.setdefault(message["media_group_id"], {"messages": [], "last": 0})
             group["messages"].append(message)
@@ -403,11 +550,11 @@ class Bot:
         webhook = self.tg("getWebhookInfo")
         if webhook.get("url"):
             raise ConfigError("WEBHOOK_ACTIVE: сначала отключи прежнее подключение бота. Автоматически ничего не удалено.")
-        print("Editor 4.1 started", flush=True)
+        print("Editor 4.2 started", flush=True)
         offset = 0
         while True:
             try:
-                updates = self.tg("getUpdates", offset=offset, timeout=2 if self.groups else 25, allowed_updates=["message"])
+                updates = self.tg("getUpdates", offset=offset, timeout=2 if self.groups else 25, allowed_updates=["message", "callback_query"])
                 for update in updates:
                     offset = update["update_id"] + 1
                     self.safe_handle(update)
