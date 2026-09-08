@@ -24,6 +24,10 @@ POST_RULES = """Ты редактор объявлений о поиске мо�
 KEYBOARD = {"keyboard": [["Оформить пост"], ["Включить автоответы", "Выключить автоответы"], ["Статус"]], "resize_keyboard": True}
 
 
+class ConfigError(Exception):
+    """Only fixed, secret-free diagnostic messages may be used here."""
+
+
 class ApiError(Exception):
     def __init__(self, service, code):
         self.service, self.code = service, code
@@ -54,17 +58,28 @@ class Bot:
     def __init__(self):
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.key = os.environ.get("GROQ_API_KEY", "").strip()
+        if not self.token:
+            raise ConfigError("TOKEN_MISSING: TELEGRAM_BOT_TOKEN is empty or unavailable to this deployment.")
+        if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", self.token):
+            raise ConfigError("TOKEN_FORMAT: Telegram token contains invalid characters, quotes or internal whitespace.")
+        if self.key and not re.fullmatch(r"[A-Za-z0-9_-]+", self.key):
+            raise ConfigError("GROQ_KEY_FORMAT: Groq key contains invalid characters, quotes or internal whitespace.")
         owner = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
-        self.owner = int(owner) if owner.isdigit() and int(owner) > 0 else 0
+        if owner and not re.fullmatch(r"[0-9]+", owner):
+            raise ConfigError("OWNER_ID_FORMAT: OWNER_TELEGRAM_ID must contain digits only.")
+        self.owner = int(owner) if owner else 0
         self.model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-        self.faq = json.loads(os.environ.get("BUSINESS_FAQ_JSON", "[]"))
+        try:
+            self.faq = json.loads(os.environ.get("BUSINESS_FAQ_JSON", "[]").strip() or "[]")
+        except ValueError:
+            raise ConfigError("FAQ_JSON_INVALID: BUSINESS_FAQ_JSON must contain valid JSON; leave unset during setup.") from None
         if not isinstance(self.faq, list) or len(self.faq) > 30:
-            raise ValueError("BUSINESS_FAQ_JSON must be a list of at most 30 entries")
+            raise ConfigError("FAQ_LIST_INVALID: BUSINESS_FAQ_JSON must be a list of at most 30 entries.")
         for entry in self.faq:
             if not isinstance(entry, dict) or any(not isinstance(entry.get(k), str) or not entry[k].strip() for k in ("question", "answer")):
-                raise ValueError("Each FAQ needs question and answer")
+                raise ConfigError("FAQ_ENTRY_INVALID: Each FAQ needs question and answer strings.")
             if len(entry["answer"]) > 3000 or len(entry["question"]) > 1000:
-                raise ValueError("FAQ entry too long")
+                raise ConfigError("FAQ_TOO_LONG: question exceeds 1000 or answer exceeds 3000 characters.")
         self.enabled_until = 0
         self.muted = {}
         self.last_reply = {}
@@ -214,11 +229,10 @@ class Bot:
         # Edits, deletions and unrelated update types never trigger replies.
 
     def run(self):
-        if not self.token:
-            raise ValueError("Set TELEGRAM_BOT_TOKEN in Railway Variables")
+        print("Startup v2: configuration checked; checking Telegram connection", flush=True)
         webhook = self.tg("getWebhookInfo")
         if webhook.get("url"):
-            raise ValueError("Existing webhook detected; disconnect previous bot hosting before polling")
+            raise ConfigError("WEBHOOK_ACTIVE: Telegram is connected to another webhook. It has NOT been removed. Disconnect the previous integration before starting this bot.")
         print("Bot started; automatic business replies OFF", flush=True)
         offset = 0
         while True:
@@ -245,9 +259,17 @@ class Bot:
                 time.sleep(10)
 
 
+def startup_error(exc):
+    if isinstance(exc, ConfigError):
+        return str(exc)
+    if isinstance(exc, ApiError):
+        return f"API_ERROR: {exc.service}, code={exc.code}. Check that service's credentials or network access."
+    return "UNEXPECTED_STARTUP_ERROR: " + type(exc).__name__
+
+
 if __name__ == "__main__":
     try:
         Bot().run()
     except Exception as exc:
-        print("Startup failed: check Variables, FAQ JSON and webhook. " + type(exc).__name__, flush=True)
+        print(startup_error(exc), flush=True)
         raise SystemExit(1)
