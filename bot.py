@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 import uuid
 import json
 import os
@@ -204,6 +204,89 @@ def source_with_quotes(message, quotes):
     return result.strip()
 
 
+def input_links(messages):
+    links = []
+    for message in messages:
+        text = message.get("text") or message.get("caption") or ""
+        raw = text.encode("utf-16-le")
+        for e in message.get("entities", message.get("caption_entities", [])):
+            if e.get("type") == "text_link" and e.get("url"):
+                label = raw[e["offset"]*2:(e["offset"]+e["length"])*2].decode("utf-16-le")
+                links.append((label, e["url"]))
+        for match in re.finditer(r"https?://[^\s<>]+", text):
+            url = match.group().rstrip('.,);')
+            links.append(("", url))
+    return list(dict.fromkeys(links))
+
+
+def link_profile(url):
+    # Tracking parameters do not change the Instagram profile. Keep the full
+    # original URL in the outgoing entity; this only matches its visible label.
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower().removeprefix("www.") == "instagram.com":
+        keys = set(parse_qs(parsed.query, keep_blank_values=True))
+        if all(k in ("igsh", "igshid") or k.startswith("utm_") for k in keys):
+            return contact_identity(parsed._replace(query="", fragment="").geturl())
+    return contact_identity(url)
+
+
+def embed_source_links(text, entities, links):
+    edits = []
+    occupied = [(e["offset"], e["offset"]+e["length"]) for e in entities if e["type"] == "text_link"]
+    def add(a, b, label, url):
+        start, end = units(text[:a]), units(text[:b])
+        if any(start < y and end > x for x, y in occupied):
+            return
+        if any(a < y and b > x for x, y, _, _ in edits):
+            return
+        edits.append((a, b, label, url))
+    for original_label, url in links:
+        if url == FOOTER_URL or urlsplit(url).scheme not in ("https", "http", "tg", "tel"):
+            continue
+        identity = link_profile(url)
+        label = clean_text(original_label) if original_label else ""
+        if identity[0] in ("Telegram", "Instagram / Direct"):
+            label = "@"+identity[1]
+        elif not label or len(label) > 70 or "://" in label:
+            label = "Открыть ссылку"
+        for match in re.finditer(re.escape(url)+r"(?![\w])", text):
+            add(match.start(), match.end(), label, url)
+        # Only match a profile to its own platform's contact field.
+        if identity[0] in ("Telegram", "Instagram / Direct"):
+            field = "Telegram|Канал" if identity[0] == "Telegram" else "Instagram / Direct|Instagram"
+            pattern = r"(?m)^(?:[^\n]*?)(?:"+field+r"):\s*(@?"+re.escape(identity[1])+r")(?![\w.])"
+            for match in re.finditer(pattern, text, re.I):
+                add(*match.span(1), "@"+identity[1], url)
+        # Restore original embedded links in body passages and quotes.
+        if original_label and len(original_label) <= 150 and not original_label.startswith("http"):
+            candidate = clean_text(original_label)
+            matches = list(re.finditer(r"(?<![\w])"+re.escape(candidate)+r"(?![\w])",text)) if candidate else []
+            if len(matches) == 1 and identity[0] not in ("Telegram", "Instagram / Direct"):
+                match = matches[0]; add(match.start(), match.end(), candidate, url)
+    edits.sort()
+    changes = [(units(text[:a]), units(text[:b]), units(label)) for a,b,label,_ in edits]
+    def mapped(offset, end=False):
+        delta = 0
+        for a,b,length in changes:
+            if offset >= b:
+                delta += length-(b-a)
+            elif offset > a:
+                return a+delta+(length if end else 0)
+        return offset+delta
+    adjusted = []
+    for entity in entities:
+        e = dict(entity); start = mapped(e["offset"]); end = mapped(e["offset"]+e["length"], True)
+        e.update(offset=start, length=end-start)
+        if e["length"]: adjusted.append(e)
+    delta = 0
+    for (a,b,label,url),(start,end,length) in zip(edits,changes):
+        adjusted.append({"type":"text_link", "offset":start+delta,"length":length,"url":url})
+        delta += length-(end-start)
+    for a,b,label,url in reversed(edits):
+        text = text[:a]+label+text[b:]
+    return text, sorted(adjusted,key=lambda e:(e["offset"],-e["length"]))
+
+
 def without_contact_duplicates(text, contacts):
     for c in contacts:
         value = c.get("value", "") if isinstance(c, dict) else ""
@@ -225,6 +308,63 @@ def same_source_paragraph(left, right, source):
         return " ".join(re.findall(r"[а-яёa-z0-9]+", t.lower()))
     pair = norm(left)+" "+norm(right)
     return any(pair in norm(p) for p in re.split(r"\n\s*\n", source))
+
+
+def contact_identity(value, platform=""):
+    value = value.strip().rstrip('.,);')
+    if value.startswith("tel:"):
+        digits = re.sub(r"\D", "", value[4:])
+        return ("phone", "7"+digits[1:] if len(digits)==11 and digits.startswith("8") else digits)
+    if value.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_.]+", value):
+        return (platform or "username", value[1:].lower())
+    if platform in ("Instagram / Direct", "Telegram") and re.fullmatch(r"[A-Za-z0-9_.]+", value):
+        return (platform, value.lower())
+    if platform in ("WhatsApp", "Телефон") and re.fullmatch(r"\+?[\d ()-]+", value):
+        return contact_identity("tel:"+value)
+    parsed = urlsplit(value if ":" in value else "https://"+value)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path = parsed.path.strip("/")
+    if not parsed.query and not parsed.fragment:
+        if host in ("t.me", "telegram.me") and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}",path):
+            return ("Telegram", path.lower())
+        if host == "instagram.com" and re.fullmatch(r"[A-Za-z0-9_.]+",path) and path not in ("p","reel","stories","explore"):
+            return ("Instagram / Direct", path.lower())
+        if host in ("wa.me", "api.whatsapp.com") and path.isdigit():
+            return contact_identity("tel:"+path)
+    if parsed.scheme == "tg" and parsed.netloc == "resolve":
+        q = parse_qs(parsed.query)
+        if set(q)=={"domain"} and len(q['domain'])==1:
+            return ("Telegram", q['domain'][0].lower())
+    return ("url", value)
+
+
+def missing_source_contacts(source, data, result, entities=None):
+    tokens = re.findall(r"(?:https?://|tg://|tel:)[^\s<>]+|(?<![\w/])(?:t\.me|telegram\.me)/[^\s<>]+|(?<![\w])@[A-Za-z0-9_.]+", source)
+    identities = set()
+    for c in data.get("contacts", []):
+        platform = c.get("type", "")
+        if platform == "Канал":
+            platform = "Telegram"
+        value = c.get("value", "")
+        identities.add(contact_identity(value, platform))
+        for part in re.findall(r"https?://[^\s<>]+|@[A-Za-z0-9_.]+",value):
+            identities.add(contact_identity(part, platform))
+    missing=[]
+    for token in tokens:
+        token=token.rstrip('.,);')
+        if token==FOOTER_URL or any(e.get("type")=="text_link" and e.get("url")==token for e in (entities or [])):
+            continue
+        identity=contact_identity(token)
+        # Literal destinations may also remain in a body passage or quote.
+        if re.search(re.escape(token)+r"(?![\w./])",result):
+            continue
+        if identity in identities:
+            continue
+        if identity[0]=="username" and any(k in ("Telegram","Instagram / Direct","Контакт") and v==identity[1] for k,v in identities):
+            continue
+        if token not in missing:
+            missing.append(token)
+    return missing
 
 
 def render_post(data, quotes=None, source=""):
@@ -521,16 +661,20 @@ class Bot:
             self.tg("sendChatAction", chat_id=self.owner, action="typing")
         except ApiError:
             pass
+        links = input_links(messages)
         context = text
+        if links:
+            context += "\n\nВшитые ссылки (подпись, полный адрес): " + json.dumps(links, ensure_ascii=False) + "\nСохрани эти ссылки в соответствующих контактах или исходном месте текста. Не меняй адреса и параметры. Контакты не дублируй в основном тексте."
         if quotes:
             context += "\n\nЦитаты: вставь каждый ключ отдельным элементом body ровно один раз на исходном месте. Не переписывай содержимое цитат в body:\n" + json.dumps({k:v[0] for k,v in quotes.items()}, ensure_ascii=False)
-        result, entities = render_post(self.ai(context), quotes, text)
+        data = self.ai(context)
+        result, entities = render_post(data, quotes, text)
+        result, entities = embed_source_links(result, entities, links)
         entities = custom_entities(result, entities, self.emoji_store.values)
-        # Flag possible omission of literal contacts; never silently claim full verification.
-        contacts = re.findall(r"@[A-Za-z0-9_]+|https?://[^\s<>]+", text)
-        missing = [x for x in contacts if x.rstrip('.,)') not in result and x.rstrip('.,)') != FOOTER_URL]
+        missing = missing_source_contacts(text, data, result, entities)
         if missing:
-            self.send("ИИ пропустил контакт или ссылку. Готовый пост не отправлен, чтобы не потерять запись. Повтори исходник или пришли сообщение разработчику.")
+            details = "\n".join(missing[:5])[:1200]
+            self.send("Не удалось подтвердить сохранение контакта или ссылки:\n" + details + "\n\nГотовый пост не отправлен. Пришли исходник ещё раз; если повторится — перешли это сообщение разработчику.")
             return
         self.deliver(result, entities, photos)
         self.pending_photos = []
@@ -629,7 +773,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 5.1.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 5.3.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -740,7 +884,7 @@ def webhook_handler(app):
 
         def do_GET(self):
             if self.path in ("/", "/health"):
-                self.reply(200 if app.accepting else 503, "Post editor 5.1: " + app.registration_status)
+                self.reply(200 if app.accepting else 503, "Post editor 5.3: " + app.registration_status)
             else:
                 self.reply(404, "Not found")
 
@@ -800,7 +944,7 @@ class WebhookApp:
                     allowed_updates=["message", "callback_query"], max_connections=1,
                     drop_pending_updates=False)
         self.registration_status = "webhook connected"
-        print("Editor 5.1: webhook connected; no background Telegram polling.", flush=True)
+        print("Editor 5.3: webhook connected; no background Telegram polling.", flush=True)
         return True
 
     def register_startup(self):
