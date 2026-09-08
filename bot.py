@@ -1,6 +1,13 @@
 """Private photo-and-text post editor. Python standard library only."""
 from pathlib import Path
 import tempfile
+import sqlite3
+import threading
+import hashlib
+import hmac
+import signal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 import uuid
 import json
 import os
@@ -54,7 +61,12 @@ def request_json(url, payload, service, key=None, timeout=65):
 # Explicit schema keeps Telegram formatting out of model-generated markup.
 EDITOR_RULES = """Редактируй объявления аккуратно и МИНИМАЛЬНО, сохраняя исходный смысл,
 формулировки и стиль автора. Не переписывай текст полностью и не добавляй информацию от себя.
-Исправляй только ошибки, пунктуацию, повторы, лишние пробелы, капслок, перегруженность эмодзи
+Исправляй орфографию и согласование слов. Расставляй необходимые запятые,
+двоеточия перед списками и точки в конце законченных предложений. Структурируй
+основной текст по смыслу: связанные фразы вместе, новый смысловой блок отдельным
+абзацем, без лишних пустых строк. Не добавляй точку к заголовку, цене, контакту,
+адресу и названию метро механически. Исправляй только ошибки, пунктуацию, повторы,
+лишние пробелы, капслок, перегруженность эмодзи
 и неаккуратное оформление. Нельзя придумывать требования, ограничения, преимущества,
 квалификацию мастера, гарантии, противопоказания, возраст, длительность или условия.
 Не превращай авторский текст в рекламный пересказ. Сохрани обращения и первое лицо автора.
@@ -264,15 +276,6 @@ def render_post(data, quotes=None, source=""):
                             previous_body = cleaned
                 if rows[-1][0]:
                     plain("")
-    if data["metro"].strip() or data["address"].strip():
-        if rows[-1][0]:
-            plain("")
-        field("📍", "Локация:", "")
-        if data["metro"].strip():
-            plain("Ⓜ️ " + clean_text(data["metro"].removeprefix("Ⓜ️")))
-        if data["address"].strip():
-            plain(clean_text(data["address"]))
-        plain("")
     icons = {"Telegram": "🤩", "Телефон": "📞", "WhatsApp": "📞", "Instagram / Direct": "🤩", "Канал": "🤩", "Контакт": "🤩"}
     if data["contacts"] and rows[-1][0]:
         plain("")
@@ -281,6 +284,18 @@ def render_post(data, quotes=None, source=""):
             raise ApiError("Groq", "invalid_format")
         if contact["value"].strip():
             field(icons[contact["type"]], contact["type"] + ":", contact["value"].strip())
+    if data["metro"].strip() or data["address"].strip():
+        if rows[-1][0]:
+            plain("")
+        metro = clean_text(data["metro"].removeprefix("Ⓜ️"))
+        metro = re.sub(r"^метро\s*:?\s*", "", metro, flags=re.I)
+        address = clean_text(data["address"])
+        if metro:
+            plain("📍 Метро " + metro)
+            if address:
+                plain(address)
+        elif address:
+            plain("📍 " + address)
     if sorted(used_quotes) != sorted(quotes):
         raise ApiError("Groq", "quote_missing", "ИИ потерял или повторил цитату. Пост не отправлен; повтори исходник.")
     tag = "#" + "".join(re.findall(r"[а-яёa-z0-9]+", title.lower()))
@@ -357,7 +372,7 @@ def custom_entities(text, entities, settings):
     prefixes = {"📌 ": "title", "📆 Когда:": "when", "💰 Стоимость:": "cost",
                 "🤩 Telegram:": "telegram", "📞 WhatsApp:": "whatsapp", "📞 Телефон:": "phone",
                 "🤩 Instagram / Direct:": "instagram", "🤩 Канал:": "channel", "🤩 Контакт:": "contact",
-                "📍 Локация:": "location", "Ⓜ️ ": "metro", "🤍 Ищу модель Москва": "footer"}
+                "📍": "location", "🤍 Ищу модель Москва": "footer"}
     offset = 0
     for line in text.splitlines(keepends=True):
         for prefix, slot in prefixes.items():
@@ -523,7 +538,7 @@ class Bot:
     def emoji_menu(self):
         self.awaiting_emoji = None
         buttons = [{"text": ("✓ " if slot in self.emoji_store.values else "") + label, "callback_data": "emoji:" + slot}
-                   for slot, (label, _) in EMOJI_SLOTS.items()]
+                   for slot, (label, _) in EMOJI_SLOTS.items() if slot != "metro"]
         keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
         storage = "Настройки сохраняются в постоянном хранилище." if self.emoji_store.persistent else "Сначала подключи в Railway Volume с путём /data: без него настройки могут исчезнуть при обновлении сервера."
         self.tg("sendMessage", chat_id=self.owner, text="Выбери поле, затем отправь ОДИН кастомный эмодзи отдельным сообщением.\n«Стандартный» вернёт обычный значок для выбранного поля.\n/cancel — выйти.\n\n" + storage,
@@ -539,7 +554,7 @@ class Bot:
         except ApiError:
             pass
         slot = data.removeprefix("emoji:")
-        if not data.startswith("emoji:") or slot not in EMOJI_SLOTS:
+        if not data.startswith("emoji:") or slot not in EMOJI_SLOTS or slot == "metro":
             return
         self.awaiting_emoji = slot
         self.awaiting_emoji_at = time.time()
@@ -614,7 +629,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 4.4.\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 5.1.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -656,23 +671,203 @@ class Bot:
                     self.report(exc)
 
     def run(self):
-        webhook = self.tg("getWebhookInfo")
-        if webhook.get("url"):
-            raise ConfigError("WEBHOOK_ACTIVE: сначала отключи прежнее подключение бота. Автоматически ничего не удалено.")
-        print("Editor 4.4 started", flush=True)
-        offset = 0
-        while True:
+        WebhookApp(self).run()
+
+
+class UpdateStore:
+    """Commit before HTTP acknowledgement; retain short-lived dialogue on disk."""
+    def __init__(self, bot):
+        folder = bot.emoji_store.directory
+        folder.mkdir(parents=True, exist_ok=True)
+        self.path = folder / ("webhook-" + str(bot.owner) + ".sqlite3")
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, payload TEXT, done INTEGER DEFAULT 0, created REAL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS session(id INTEGER PRIMARY KEY, payload TEXT)")
+        self.db.commit()
+        row = self.db.execute("SELECT payload FROM session WHERE id=1").fetchone()
+        if row:
+            value = json.loads(row[0])
+            for key in ("pending_photos", "pending_at", "groups", "awaiting_emoji", "awaiting_emoji_at"):
+                if key in value:
+                    setattr(bot, key, value[key])
+        if time.time()-bot.pending_at > 600:
+            bot.pending_photos=[]
+        if time.time()-bot.awaiting_emoji_at > 600:
+            bot.awaiting_emoji=None
+
+    def put(self, update):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM updates WHERE done=1 AND created<?", (time.time()-7*86400,))
+            self.db.execute("INSERT OR IGNORE INTO updates(id,payload,created) VALUES(?,?,?)", (update["update_id"], json.dumps(update), time.time()))
+
+    def next(self):
+        with self.lock:
+            row = self.db.execute("SELECT id,payload FROM updates WHERE done=0 ORDER BY id LIMIT 1").fetchone()
+            return (row[0], json.loads(row[1])) if row else None
+
+    def checkpoint(self, bot, update_id=None):
+        value = {key:getattr(bot,key) for key in ("pending_photos", "pending_at", "groups", "awaiting_emoji", "awaiting_emoji_at")}
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO session VALUES(1,?)", (json.dumps(value),))
+            if update_id is not None:
+                # Erase processed post text; keep just its ID to suppress retries.
+                self.db.execute("UPDATE updates SET done=1,payload=NULL WHERE id=?", (update_id,))
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+
+def webhook_handler(app):
+    class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(10)
+
+        def log_message(self, *args):
+            pass  # Do not log headers, request content, or tokens.
+
+        def reply(self, code, message):
+            body = message.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/health"):
+                self.reply(200 if app.accepting else 503, "Post editor 5.1: " + app.registration_status)
+            else:
+                self.reply(404, "Not found")
+
+        def do_POST(self):
+            if self.path != "/telegram":
+                self.reply(404, "Not found");return
+            secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(secret.encode(), app.secret.encode()):
+                self.reply(403, "Forbidden");return
+            if not app.accepting:
+                self.reply(503, "Restarting");return
             try:
-                updates = self.tg("getUpdates", offset=offset, timeout=2 if self.groups else 25, allowed_updates=["message", "callback_query"])
-                for update in updates:
-                    offset = update["update_id"] + 1
-                    self.safe_handle(update)
-                self.flush_groups()
-                if self.pending_photos and time.time() - self.pending_at > 600:
-                    self.pending_photos = []
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024*1024:
+                    self.reply(413, "Invalid size");return
+                update = json.loads(self.rfile.read(length))
+                if not isinstance(update, dict) or type(update.get("update_id")) is not int:
+                    self.reply(400, "Invalid update");return
+            except (ValueError, OSError):
+                self.reply(400, "Invalid JSON");return
+            # Public endpoint accepts only signed Telegram requests. The existing
+            # private-chat/owner checks still run before any AI call.
+            try:
+                app.store.put(update)
+            except (OSError, sqlite3.Error):
+                self.reply(503, "Storage unavailable");return
+            app.wake.set()
+            self.reply(200, "OK")
+    return Handler
+
+
+class WebhookApp:
+    def __init__(self, bot, host="0.0.0.0", port=None):
+        self.bot = bot
+        self.secret = hmac.new(bot.token.encode(), b"post-editor-webhook-v1", hashlib.sha256).hexdigest()
+        self.store = UpdateStore(bot)
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.accepting = True
+        self.registration_status = "awaiting domain"
+        self.server = ThreadingHTTPServer((host, int(os.environ.get("PORT", "8080")) if port is None else port), webhook_handler(self))
+        self.worker = threading.Thread(target=self.work, daemon=True)
+
+    def register(self):
+        base = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+        if not base:
+            domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+            if domain:
+                base = "https://" + domain
+        if not base:
+            print("WEBHOOK_NEEDS_DOMAIN: Settings > Networking > Generate Domain, target port 8080. Then redeploy.", flush=True)
+            return False
+        parsed = urlsplit(base)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+            raise ConfigError("PUBLIC_URL должен быть HTTPS-адресом сервиса без пути, параметров и ключей.")
+        self.bot.tg("setWebhook", url=base+"/telegram", secret_token=self.secret,
+                    allowed_updates=["message", "callback_query"], max_connections=1,
+                    drop_pending_updates=False)
+        self.registration_status = "webhook connected"
+        print("Editor 5.1: webhook connected; no background Telegram polling.", flush=True)
+        return True
+
+    def register_startup(self):
+        for attempt in range(3):
+            try:
+                self.register()
+                return
             except ApiError as exc:
+                self.registration_status = "webhook registration failed"
                 print(error_message(exc), flush=True)
-                time.sleep(5)
+                if self.stop.wait(5):
+                    return
+            except ConfigError as exc:
+                self.registration_status = "check PUBLIC_URL"
+                print(error_message(exc), flush=True)
+                return
+        print("WEBHOOK_REGISTRATION_FAILED: check deployment logs and redeploy after fixing access.", flush=True)
+
+    def work_once(self):
+        item = self.store.next()
+        if item:
+            uid, update = item
+            self.bot.safe_handle(update)
+            self.store.checkpoint(self.bot, uid)
+            return True
+        if self.bot.groups:
+            self.bot.flush_groups()
+            self.store.checkpoint(self.bot)
+        return False
+
+    def work(self):
+        while not self.stop.is_set():
+            self.wake.clear()
+            try:
+                if self.work_once():
+                    continue
+            except Exception as exc:
+                print("Webhook worker stopped: " + type(exc).__name__, flush=True)
+                self.accepting = False
+                self.stop.set()
+                self.server.shutdown()
+                return
+            # No network traffic or periodic checks while idle. Only album
+            # collection uses a short timer; otherwise wait for a webhook.
+            self.wake.wait(0.5 if self.bot.groups else None)
+
+    def shutdown(self):
+        self.accepting = False
+        self.stop.set()
+        self.wake.set()
+        self.server.shutdown()
+
+    def run(self):
+        self.worker.start()
+        threading.Thread(target=self.register_startup, daemon=True).start()
+        def terminate(*args):
+            threading.Thread(target=self.shutdown, daemon=True).start()
+        signal.signal(signal.SIGTERM, terminate)
+        signal.signal(signal.SIGINT, terminate)
+        try:
+            self.server.serve_forever(poll_interval=0.5)
+        finally:
+            self.accepting=False;self.stop.set();self.wake.set()
+            self.worker.join(timeout=75)
+            self.server.server_close()
+            if not self.worker.is_alive():
+                self.store.close()
 
 
 if __name__ == "__main__":
