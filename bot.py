@@ -226,7 +226,7 @@ def source_with_quotes(message, quotes):
                 a = (custom["offset"]-e["offset"])*2; b = a+custom["length"]*2
                 qraw = quote.encode("utf-16-le");quote = (qraw[:a]+qraw[b:]).decode("utf-16-le")
         token = "[[QUOTE_" + uuid.uuid4().hex + "]]"
-        quotes[token] = (clean_text(quote), e["type"])
+        quotes[token] = (re.sub(r"\n[ \t]*\n(?=– )", "\n", clean_text(quote)), e["type"])
         edits.append((start, end, token))
     for e in entities:
         if e.get("type") == "custom_emoji" and not any(q["offset"] <= e["offset"] < q["offset"]+q["length"] for q in quote_spans):
@@ -470,6 +470,33 @@ def missing_source_contacts(source, data, result, entities=None):
     return missing
 
 
+def recover_quote_tokens(data, quotes):
+    if not quotes or not isinstance(data, dict) or not isinstance(data.get("body"), list) or any(not isinstance(p, str) for p in data["body"]):
+        return data
+    body = clean_text("\n\n".join(data["body"]))
+    for token, (original, _) in quotes.items():
+        # Accept only the known identifier, never map an unknown quote by order.
+        identifier = token[2:-2]
+        body = re.sub(r"\[\[\s*"+re.escape(identifier)+r"\s*\]\]", token, body, flags=re.I)
+        words = re.findall(r"\w+", original)
+        # If the model copied the quote as prose, recover its original formatting
+        # only for a complete word-for-word match (punctuation may differ).
+        if words:
+            pattern = r"(?<!\w)(?:[–—-][ \t]+)?" + r"[^\w]+".join(re.escape(w) for w in words) + r"(?!\w)[ \t.;!?]*"
+            body = re.sub(pattern, lambda match: token, body, flags=re.I)
+    seen = set()
+    def once(match):
+        token = match[0]
+        if token not in quotes:
+            return token
+        if token in seen:
+            return ""
+        seen.add(token)
+        return token
+    body = re.sub(r"\[\[QUOTE_[a-f0-9]+\]\]", once, body)
+    return {**data, "body": [p.strip() for p in re.split(r"\n\s*\n",body) if p.strip()]}
+
+
 def render_post(data, quotes=None, source=""):
     quotes = quotes or {}
     if not isinstance(data, dict):
@@ -512,7 +539,7 @@ def render_post(data, quotes=None, source=""):
                         cleaned = format_price_block(remove_header_repeats(without_contact_duplicates(clean_text(part), data["contacts"]), data["when"], data["cost"]))
                         cleaned = restore_source_layout(cleaned, source)
                         if cleaned:
-                            if previous_body and same_source_paragraph(previous_body, cleaned, source) and rows[-1][0] == "":
+                            if previous_body and previous_body not in quotes and same_source_paragraph(previous_body, cleaned, source) and rows[-1][0] == "":
                                 rows.pop()
                                 prior = rows.pop()[0]
                                 cleaned = prior + " " + cleaned
@@ -772,7 +799,17 @@ class Bot:
         if quotes:
             context += "\n\nЦитаты: вставь каждый ключ отдельным элементом body ровно один раз на исходном месте. Не переписывай содержимое цитат в body:\n" + json.dumps({k:v[0] for k,v in quotes.items()}, ensure_ascii=False)
         data = self.ai(context)
-        result, entities = render_post(data, quotes, text)
+        data = recover_quote_tokens(data, quotes)
+        try:
+            result, entities = render_post(data, quotes, text)
+        except ApiError as exc:
+            if exc.code != "quote_missing":
+                raise
+            # One automatic repair request, using the complete original source.
+            # Never silently drop a quote or append it at an invented position.
+            retry_context = context + "\n\nПРОВЕРКА ЦИТАТ: предыдущий ответ потерял метку цитаты. Верни полный исправленный JSON. Каждый из этих ключей должен быть отдельным элементом body ровно один раз, в исходном порядке и месте: " + json.dumps(list(quotes), ensure_ascii=False) + " Не пересказывай содержимое цитат и не заменяй ключи текстом."
+            data = recover_quote_tokens(self.ai(retry_context), quotes)
+            result, entities = render_post(data, quotes, text)
         result, entities = embed_source_links(result, entities, links)
         entities = custom_entities(result, entities, self.emoji_store.values)
         missing = missing_source_contacts(text, data, result, entities)
@@ -877,7 +914,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 5.5.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 5.6.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -988,7 +1025,7 @@ def webhook_handler(app):
 
         def do_GET(self):
             if self.path in ("/", "/health"):
-                self.reply(200 if app.accepting else 503, "Post editor 5.5: " + app.registration_status)
+                self.reply(200 if app.accepting else 503, "Post editor 5.6: " + app.registration_status)
             else:
                 self.reply(404, "Not found")
 
@@ -1048,7 +1085,7 @@ class WebhookApp:
                     allowed_updates=["message", "callback_query"], max_connections=1,
                     drop_pending_updates=False)
         self.registration_status = "webhook connected"
-        print("Editor 5.5: webhook connected; no background Telegram polling.", flush=True)
+        print("Editor 5.6: webhook connected; no background Telegram polling.", flush=True)
         return True
 
     def register_startup(self):
