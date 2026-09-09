@@ -94,6 +94,23 @@ cost: самая низкая цена ПОЛНОЦЕННОЙ указанной
 
 body: основной авторский текст максимально близко к оригиналу, кроме перенесенных в поля
 даты, общей стоимости, контактов, локации и подписи. Не убирай факты ради краткости.
+Дату/время и общую цену, уже вынесенные в when и cost, НЕ ПОВТОРЯЙ в body,
+даже если в исходнике они стоят внутри предложения. При удалении сохрани соседние
+существенные уточнения: объём, технику, длительность, требования и условия.
+Пример: when «10 сентября в 12:00», cost «500₽»; исходник «Ищем моделей на
+наращивание ресниц. 10 сентября в 12:00 (объём 1,5–2 д). Цена: 500₽ (занятость
+от 4 часов)» → body «Ищем моделей на наращивание ресниц. Объём 1,5–2 д.
+Занятость от 4 часов.» (один абзац). Не удаляй разные цены позиций прайса,
+доплаты и разные даты отдельных услуг: это самостоятельные сведения.
+Если исходный пост уже аккуратно оформлен, СОХРАНИ его абзацы, пустые строки
+между смысловыми блоками, порядок и списки. Не собирай весь пост одним элементом
+body. Каждый исходный смысловой абзац — отдельный элемент body.
+Вводная фраза списка и сам список — один элемент body с переносами строк.
+Каждый пункт должен начинаться с «– ». Любой эмодзи-маркер в начале пунктов
+(включая 🎯) ЗАМЕНЯЙ на «– », а не просто удаляй. Эмодзи в конце обычного
+предложения удали и поставь нужную точку. Пункты с точкой с запятой сохраняй
+отдельными строками, последний пункт заканчивай точкой. Не отделяй каждый пункт
+пустым абзацем. Не добавляй пустую строку между вводной фразой и списком.
 Не дроби каждое предложение на абзац. Сохраняй группировку исходных абзацев:
 соседние связанные фразы одного исходного абзаца должны быть одним элементом body.
 «Инъекции — это вчера! Есть метод волшебнее.» — один абзац.
@@ -188,7 +205,7 @@ def clean_text(text):
     lines = []
     for line in text.splitlines():
         # Explicit list symbols become dashes; decorative emojis simply disappear.
-        line = re.sub(r"^\s*(?:[✓✔✅☑•●▪▫■◆🔹🔸🔺🔻➕]\ufe0f?|[–—-])\s*", "– ", line)
+        line = re.sub(r"^\s*(?:[✓✔✅☑•●▪▫■◆🔹🔸🔺🔻➕🎯]\ufe0f?|[–—-])\s*", "– ", line)
         line = EMOJI_RE.sub("", line)
         lines.append(re.sub(r"[ \t]+", " ", line).strip())
     return normalize_caps("\n".join(lines)).strip()
@@ -322,6 +339,57 @@ def without_contact_duplicates(text, contacts):
     return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
+def restore_source_layout(text, source):
+    def key(line):
+        return " ".join(re.findall(r"[\w]+", clean_text(line).lower()))
+    source_lines = source.splitlines()
+    list_keys, paragraph_keys = set(), set()
+    for i, line in enumerate(source_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^[–—•●▪✓✔✅☑🎯-]", stripped):
+            list_keys.add(key(line))
+        elif EMOJI_RE.match(stripped):
+            # Repeated emoji-led lines indicate a list, not a decorative heading.
+            adjacent = [source_lines[j].strip() for j in (i-1,i+1) if 0 <= j < len(source_lines)]
+            if any(EMOJI_RE.match(v) for v in adjacent):
+                list_keys.add(key(line))
+        if i and not source_lines[i-1].strip():
+            paragraph_keys.add(key(line))
+    output = []
+    for line in text.splitlines():
+        k = key(line)
+        if k and k in list_keys:
+            line = "– " + re.sub(r"^[–—-]\s*", "", line.strip())
+        elif k and k in paragraph_keys and output and output[-1].strip():
+            output.append("")
+        output.append(line)
+    return "\n".join(output)
+
+
+def remove_header_repeats(text, when, cost):
+    # Conservative fallback: only exact header facts, never individual prices
+    # in a structured price section. Other dates and amounts remain untouched.
+    if re.search(r"\s[—–-]\s+\d", text):
+        return text
+    when = clean_text(when).strip()
+    if when and when.lower() != "по записи":
+        pattern = re.escape(when).replace(r"\ ", r"\s+")
+        text = re.sub(r"(?<!\w)(?:(?:Когда|Дата|Время):\s*)?"+pattern+r"(?!\w)", "", text, flags=re.I)
+    amount = re.fullmatch(r"([\d \u00a0]+)\s*(?:₽|руб\.?|рублей)", cost.strip(), re.I)
+    if amount:
+        digits = re.sub(r"\s", "", amount[1])
+        pattern = r"[ \u00a0]*".join(digits)
+        text = re.sub(r"(?<!\d)(?:(?:Цена|Стоимость):?\s*)?"+pattern+r"\s*(?:₽|рублей|руб\.?)(?!\w)", "", text, flags=re.I)
+    # Parenthetical details must survive removal of the date or price.
+    text = re.sub(r"(^|[.!?]\s*)\s*\(([^()]+)\)", lambda m:m[1]+m[2][0].upper()+m[2][1:], text)
+    text = re.sub(r"[ \t]+([.,;])", r"\1", text)
+    text = re.sub(r"([.!?])(?:\s*[.;])+", r"\1", text)
+    text = re.sub(r"^[\s.,;]+", "", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
 def format_price_block(text):
     # Repair collapsed price lists without guessing service names or amounts.
     price = r"[—–-]\s*\d"
@@ -441,7 +509,8 @@ def render_post(data, quotes=None, source=""):
                         plain(part)
                         previous_body = part
                     elif part.strip():
-                        cleaned = format_price_block(without_contact_duplicates(clean_text(part), data["contacts"]))
+                        cleaned = format_price_block(remove_header_repeats(without_contact_duplicates(clean_text(part), data["contacts"]), data["when"], data["cost"]))
+                        cleaned = restore_source_layout(cleaned, source)
                         if cleaned:
                             if previous_body and same_source_paragraph(previous_body, cleaned, source) and rows[-1][0] == "":
                                 rows.pop()
@@ -808,7 +877,7 @@ class Bot:
         elif text == "/id":
             self.send(f"Твой Telegram ID: {self.owner}")
         elif text == "/status":
-            self.send(f"Редактор 5.4.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
+            self.send(f"Редактор 5.5.\nРежим: webhook (без опроса Telegram).\nМодель: {self.model}.\nКастомных эмодзи: {len(self.emoji_store.values)}.\n/emoji — настроить эмодзи.\nФото не изменяются. /test — проверить Groq.")
         elif text == "/test":
             self.ai("OK", test=True)
             self.send("Groq ответил. Пришли пост для оформления.")
@@ -919,7 +988,7 @@ def webhook_handler(app):
 
         def do_GET(self):
             if self.path in ("/", "/health"):
-                self.reply(200 if app.accepting else 503, "Post editor 5.4: " + app.registration_status)
+                self.reply(200 if app.accepting else 503, "Post editor 5.5: " + app.registration_status)
             else:
                 self.reply(404, "Not found")
 
@@ -979,7 +1048,7 @@ class WebhookApp:
                     allowed_updates=["message", "callback_query"], max_connections=1,
                     drop_pending_updates=False)
         self.registration_status = "webhook connected"
-        print("Editor 5.4: webhook connected; no background Telegram polling.", flush=True)
+        print("Editor 5.5: webhook connected; no background Telegram polling.", flush=True)
         return True
 
     def register_startup(self):
